@@ -1,0 +1,50 @@
+# Build output
+**/bin/
+**/obj/
+/Server/publish/
+/Client/publish/
+/dist/
+/target/
+/logs/
+
+# Compiled Windows binaries and debug files
+*.exe
+*.exe~
+*.dll
+*.pdb
+*.test
+
+# Runtime configuration contains the shared tunnel token
+server.json
+client.json
+*.local.json
+
+# Go test and profiling output
+coverage.out
+*.coverprofile
+*.prof
+*.pprof
+
+# IDE and editor files
+.vs/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary files and logs
+*.tmp
+*.bak
+*.old
+*.log
+*.stackdump
+
+# Local environment secrets
+.env
+.env.*
+!.env.example
