@@ -244,7 +244,6 @@ func Run(mode string) error {
 	var editSelectedButton *walk.PushButton
 	var toggleMappingButton *walk.PushButton
 	var deleteSelectedButton, copyKeyButton *walk.PushButton
-	var restartCurrentService func()
 	serviceActive := func() bool { lock.Lock(); defer lock.Unlock(); return runCancel != nil || reconnecting }
 	mapModel = &mappingTableModel{server: server}
 	var mappingsS = append([]tunnel.Mapping(nil), serverCfg.Mappings...)
@@ -271,9 +270,11 @@ func Run(mode string) error {
 	for _, m := range mappingsS {
 		mappingSwitches.SetEnabled(tunnel.ServerMappingSwitchKey(m), !m.Disabled)
 	}
+	mappingSwitches.SetServerMappings(mappingsS)
 	for _, m := range mappingsC {
 		mappingSwitches.SetEnabled(tunnel.ClientMappingSwitchKey(m), !m.Disabled)
 	}
+	mappingSwitches.SetClientMappings(mappingsC)
 	icon, _ := walk.NewIconFromResourceId(1)
 	closeMode := 0
 	if clientCfg.CloseAction == "exit" {
@@ -462,11 +463,13 @@ func Run(mode string) error {
 				if index >= 0 && index < len(mappingsS) {
 					mappingSwitches.SetEnabled(tunnel.ServerMappingSwitchKey(mappingsS[index]), !mappingsS[index].Disabled)
 				}
+				mappingSwitches.SetServerMappings(mappingsS)
 			} else {
 				clientCfg.Mappings = append([]tunnel.LocalMapping(nil), mappingsC...)
 				if index >= 0 && index < len(mappingsC) {
 					mappingSwitches.SetEnabled(tunnel.ClientMappingSwitchKey(mappingsC[index]), !mappingsC[index].Disabled)
 				}
+				mappingSwitches.SetClientMappings(mappingsC)
 			}
 			if err := writeConfig(); err != nil {
 				walk.MsgBox(dlg, "保存映射失败", err.Error(), walk.MsgBoxIconWarning)
@@ -480,10 +483,12 @@ func Run(mode string) error {
 				m := mappingsC[index]
 				setStatus(fmt.Sprintf("映射已保存：名称=%s，协议=%s，本地=%s:%d，Server 公网端口=%d，标识=%s", m.Name, strings.ToUpper(m.Protocol), m.LocalHost, m.LocalPort, m.RemotePort, tunnelKeySummary(m.Key)))
 			}
-			needsRestart := serviceActive()
+			serviceWasActive := serviceActive()
 			dlg.Accept()
-			if needsRestart && restartCurrentService != nil {
-				restartCurrentService()
+			if serviceWasActive && server {
+				appendLog("Server 映射授权规则已热更新；后续 FRP 代理注册按当前映射列表校验")
+			} else if serviceWasActive {
+				appendLog("Client 映射配置已保存，FRP 将在线更新变更的代理，其他映射保持连接")
 			}
 		}
 		children := []Widget{}
@@ -555,11 +560,13 @@ func Run(mode string) error {
 			mappingSwitches.SetEnabled(tunnel.ServerMappingSwitchKey(mappingsS[i]), false)
 			mappingsS = append(mappingsS[:i], mappingsS[i+1:]...)
 			serverCfg.Mappings = append([]tunnel.Mapping(nil), mappingsS...)
+			mappingSwitches.SetServerMappings(mappingsS)
 		} else if !server && i < len(mappingsC) {
 			deletedName = mappingsC[i].Name
 			mappingSwitches.SetEnabled(tunnel.ClientMappingSwitchKey(mappingsC[i]), false)
 			mappingsC = append(mappingsC[:i], mappingsC[i+1:]...)
 			clientCfg.Mappings = append([]tunnel.LocalMapping(nil), mappingsC...)
+			mappingSwitches.SetClientMappings(mappingsC)
 		}
 		if e := writeConfig(); e != nil {
 			walk.MsgBox(mw, "删除映射失败", e.Error(), walk.MsgBoxIconWarning)
@@ -567,8 +574,10 @@ func Run(mode string) error {
 		}
 		refreshList(-1)
 		setStatus(fmt.Sprintf("已删除映射：%s", deletedName))
-		if serviceActive() && restartCurrentService != nil {
-			restartCurrentService()
+		if serviceActive() && server {
+			appendLog("Server 已撤销该映射的注册授权；Client 后续注册将被拒绝，已注册代理保持现状")
+		} else if serviceActive() {
+			appendLog("Client 映射已删除，FRP 将在线移除此代理，其他映射保持连接")
 		}
 	}
 	toggleMapping := func() {
@@ -592,6 +601,11 @@ func Run(mode string) error {
 			return
 		}
 		mappingSwitches.SetEnabled(switchKey, enabled)
+		if server {
+			mappingSwitches.SetServerMappings(mappingsS)
+		} else {
+			mappingSwitches.SetClientMappings(mappingsC)
+		}
 		if err := writeConfig(); err != nil {
 			walk.MsgBox(mw, "保存映射状态失败", err.Error(), walk.MsgBoxIconWarning)
 		}
@@ -656,7 +670,7 @@ func Run(mode string) error {
 					enabled++
 				}
 			}
-			appendLog(fmt.Sprintf("启动 Client：Server=%s:%d，ClientID=%s，映射数=%d（启用=%d），TCP 由系统路由转发", clientToRun.ServerAddress, clientToRun.ServerPort, clientToRun.ClientID, len(clientToRun.Mappings), enabled))
+			appendLog(fmt.Sprintf("启动 Client：Server=%s:%d，ClientID=%s，映射数=%d（启用=%d），所有映射共用握手连接", clientToRun.ServerAddress, clientToRun.ServerPort, clientToRun.ClientID, len(clientToRun.Mappings), enabled))
 		}
 		lock.Lock()
 		if runCancel != nil || reconnecting {
@@ -760,8 +774,6 @@ func Run(mode string) error {
 			})
 		}()
 	}
-	restartCurrentService = reconnect
-
 	mapModel.Reset(mappingsS, mappingsC)
 	mapColumns := []TableViewColumn{{Title: "序号", Width: 48}, {Title: "映射备注", Width: 110}, {Title: "状态", Width: 70}, {Title: "协议", Width: 55}, {Title: "公网监听地址", Width: 135}, {Title: "端口", Width: 55}, {Title: "客户端 ID", Width: 90}, {Title: "映射 Key", Width: 205}}
 	if !server {
@@ -835,15 +847,15 @@ func Run(mode string) error {
 	if server {
 		widgets = []Widget{
 			Label{Text: "AkitaFrp Server", Font: Font{PointSize: 21, Bold: true}, TextColor: walk.RGB(22, 76, 91)}, Label{Text: "管理公网 TCP/UDP 入口，将访客流量转发给已连接的 Client。"},
-			GroupBox{Title: "Client 接入设置", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "此地址和端口供 Client 连接 Server 使用；访客访问的公网端口请在下方“公网端口映射”中设置。"}, Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "接入地址"}, LineEdit{AssignTo: &controlAddress, Text: serverCfg.ControlAddress}, Label{Text: "接入端口"}, LineEdit{AssignTo: &controlPort, Text: strconv.Itoa(serverCfg.ControlPort)}}}, Composite{Layout: HBox{Spacing: 8}, Children: []Widget{Label{Text: "共享 Token"}, LineEdit{AssignTo: &token, Text: serverCfg.Token, StretchFactor: 1}}}, serverControls}},
-			GroupBox{Title: "公网端口映射", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "这里配置访客访问的公网端口和转发目标。单击行选中，单击列表空白处取消选择；双击行可编辑。"}, mapListWidget, mapButtons}},
+			GroupBox{Title: "Client 接入设置", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "此地址和端口供 Client 握手连接；各端口映射通过同一条 FRP 连接承载。"}, Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "接入地址"}, LineEdit{AssignTo: &controlAddress, Text: serverCfg.ControlAddress}, Label{Text: "接入端口"}, LineEdit{AssignTo: &controlPort, Text: strconv.Itoa(serverCfg.ControlPort)}}}, Composite{Layout: HBox{Spacing: 8}, Children: []Widget{Label{Text: "共享 Token"}, LineEdit{AssignTo: &token, Text: serverCfg.Token, StretchFactor: 1}}}, serverControls}},
+			GroupBox{Title: "公网端口映射", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "这里设置 Client 可注册的公网映射；删除后 Server 会拒绝该映射后续注册。Client 侧增删会在线更新单条代理，不重启握手连接。单击行选中，单击列表空白处取消选择；双击行可编辑。"}, mapListWidget, mapButtons}},
 			logPanel, HSeparator{}, Label{AssignTo: &status, Text: "状态：已停止"},
 		}
 	} else {
 		widgets = []Widget{
 			Label{Text: "AkitaFrp Client", Font: Font{PointSize: 21, Bold: true}, TextColor: walk.RGB(22, 76, 91)}, Label{Text: "填入服务器信息和本机服务地址，建立反向隧道。"},
-			GroupBox{Title: "服务器连接", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "服务器地址"}, LineEdit{AssignTo: &serverAddress, Text: clientCfg.ServerAddress, CueBanner: "公网 IP 或域名"}, Label{Text: "服务器端口"}, LineEdit{AssignTo: &serverPort, Text: strconv.Itoa(clientCfg.ServerPort)}}}, Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "共享 Token"}, LineEdit{AssignTo: &token, Text: clientCfg.Token}, Label{Text: "客户端 ID"}, LineEdit{AssignTo: &clientID, Text: clientCfg.ClientID}}}, Label{Text: "断线后由 FRP 自动重连。"}, CheckBox{AssignTo: &resumeLastConnection, Text: "上次退出时处于连接状态，下次启动自动连接", Checked: clientCfg.ResumeLastConnection}, clientControls}},
-			GroupBox{Title: "本地服务映射 · FRP 代理", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "填写与 Server 一致的公网端口和协议；映射标识用于生成 FRP 代理名称。单击行选中，单击列表空白处取消选择；双击行可编辑。"}, mapListWidget, mapButtons}},
+			GroupBox{Title: "服务器连接", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "服务器地址"}, LineEdit{AssignTo: &serverAddress, Text: clientCfg.ServerAddress, CueBanner: "公网 IP 或域名"}, Label{Text: "服务器端口"}, LineEdit{AssignTo: &serverPort, Text: strconv.Itoa(clientCfg.ServerPort)}}}, Composite{Layout: Grid{Columns: 4, Spacing: 8}, Children: []Widget{Label{Text: "共享 Token"}, LineEdit{AssignTo: &token, Text: clientCfg.Token}, Label{Text: "客户端 ID"}, LineEdit{AssignTo: &clientID, Text: clientCfg.ClientID}}}, Label{Text: "所有映射共用一次服务器握手；FRP 会为每条映射建立独立代理，断线后自动重连。"}, CheckBox{AssignTo: &resumeLastConnection, Text: "上次退出时处于连接状态，下次启动自动连接", Checked: clientCfg.ResumeLastConnection}, clientControls}},
+			GroupBox{Title: "本地服务映射 · FRP 代理", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 7}, Children: []Widget{Label{Text: "填写与 Server 一致的公网端口和协议，并粘贴 Server 生成的映射 Key。单击行选中，单击列表空白处取消选择；双击行可编辑。"}, mapListWidget, mapButtons}},
 			GroupBox{Title: "启动设置", Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Layout: VBox{Margins: Margins{12, 8, 12, 10}, Spacing: 6}, Children: []Widget{Composite{Layout: HBox{Spacing: 8}, Children: []Widget{Label{Text: "关闭窗口时"}, ComboBox{AssignTo: &closeBox, Model: []string{"最小化到系统托盘", "退出程序"}, CurrentIndex: closeMode}, CheckBox{AssignTo: &auto, Text: "随 Windows 登录启动", Checked: clientCfg.AutoStart}}}, Label{Text: "连接使用系统默认 TCP 路由。"}}},
 			logPanel, HSeparator{}, Label{AssignTo: &status, Text: "状态：已停止"},
 		}
